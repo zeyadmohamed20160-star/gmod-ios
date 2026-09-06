@@ -1,36 +1,131 @@
-# This is a basic workflow to help you get started with Actions
+name: Deep Binary Analysis + iOS Porting Workspace
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: write
+
+concurrency:
+  group: deep-analysis-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+  analyze:
+    name: Analyze EXE/DLL files
+    runs-on: ubuntu-24.04
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Set up Git LFS
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          git lfs install
+          git lfs pull
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            file \
+            unzip \
+            wget \
+            openjdk-21-jdk \
+            python3-dev
+
+      - name: Install Python analysis libraries
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            pefile \
+            capstone
+
+      - name: Install radare2
+        run: |
+          if ! command -v r2 >/dev/null 2>&1; then
+            sudo apt-get install -y radare2 || true
+          fi
+
+      - name: Download Ghidra
+        env:
+          GHIDRA_VERSION: "12.1.3"
+        run: |
+          mkdir -p "$RUNNER_TEMP/ghidra"
+
+          wget -q \
+            "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_20260818.zip" \
+            -O "$RUNNER_TEMP/ghidra/ghidra.zip"
+
+          unzip -q \
+            "$RUNNER_TEMP/ghidra/ghidra.zip" \
+            -d "$RUNNER_TEMP/ghidra"
+
+          GHIDRA_HOME="$(find "$RUNNER_TEMP/ghidra" -maxdepth 1 -type d -name "ghidra_*" | head -n 1)"
+
+          if [ -z "$GHIDRA_HOME" ]; then
+            echo "Ghidra directory was not found."
+            exit 1
+          fi
+
+          echo "GHIDRA_HOME=$GHIDRA_HOME" >> "$GITHUB_ENV"
+
+      - name: Verify analysis tools
+        run: |
+          echo "Python:"
+          python --version
+
+          echo "Java:"
+          java -version
+
+          echo "Ghidra:"
+          "$GHIDRA_HOME/support/analyzeHeadless" -help >/dev/null
+
+          echo "Other tools:"
+          command -v strings || true
+          command -v objdump || true
+          command -v r2 || true
+
+      - name: Run deep analysis
+        env:
+          GHIDRA_HOME: ${{ env.GHIDRA_HOME }}
+        run: |
+          python deep_reverse.py
+
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-analysis
+          path: |
+            analysis/
+            ios_port/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Commit generated reports
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add analysis/ ios_port/
+
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Automated binary analysis reports [skip ci]"
+          git push
